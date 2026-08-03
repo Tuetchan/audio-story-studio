@@ -59,9 +59,9 @@ with st.sidebar:
     # Chuyển đổi bảng phân vai thành Dictionary
     role_map = {}
     for _, row in edited_roles.iterrows():
-        role_map[row["Mã @"].strip().lower()] = {
+        role_map[str(row["Mã @"]).strip().lower()] = {
             "provider": row["Nguồn Giọng"],
-            "voice_id": row["Voice ID"].strip()
+            "voice_id": str(row["Voice ID"]).strip()
         }
 
     st.markdown("---")
@@ -111,7 +111,7 @@ def generate_tts_audio(text, provider, voice_id, output_path):
 
 
 def parse_script_by_at_tag(script_text, role_map):
-    """Bóc tách kịch bản dựa vào ký hiệu @ở đầu đoạn văn"""
+    """Bóc tách kịch bản dựa vào ký hiệu @ ở đầu đoạn văn"""
     lines = script_text.split('\n')
     segments = []
     current_char = "nguoidantruyen" # Mặc định nếu chưa gõ @
@@ -121,7 +121,6 @@ def parse_script_by_at_tag(script_text, role_map):
         if not line_str:
             continue
 
-        # Regex tìm ký hiệu @Tên_Nhân_Vật ở đầu dòng
         match = re.match(r'^@([^\s:]+)\b[:\s]*(.*)', line_str)
         if match:
             char_tag = match.group(1).strip().lower()
@@ -148,11 +147,164 @@ def parse_script_by_at_tag(script_text, role_map):
 # 3. GIAO DIỆN CHÍNH & XỬ LÝ TABS
 # ==========================================
 st.title("🎧 Studio Tạo Kịch Truyền Thanh AI Pro")
-st.markdown("""
-**Hướng dẫn cú pháp:** Đặt `@Mã_Nhân_Vật` trước mỗi lời thoại. 
-Ví dụ:
-```text
-@NguoiDanTruyen Ngày xửa ngày xưa, tại một ngôi làng nọ...
-@NamChinh Ta nhất định phải ra đi tìm sự thật!
-@NuChinh Chàng hãy cẩn thận nhé!
-@NamChinh2 Ta sẽ đi cùng huynh!
+
+st.markdown(
+    "**Hướng dẫn cú pháp:** Đặt `@Mã_Nhân_Vật` trước mỗi lời thoại.\n\n"
+    "**Ví dụ mẫu:**\n"
+    "- `@NguoiDanTruyen Ngày xửa ngày xưa, tại một ngôi làng nọ...`\n"
+    "- `@NamChinh Ta nhất định phải ra đi tìm sự thật!`\n"
+    "- `@NuChinh Chàng hãy cẩn thận nhé!`\n"
+    "- `@NamChinh2 Ta sẽ đi cùng huynh!`"
+)
+
+script_input = st.text_area("Nhập kịch bản phân vai của bạn vào đây:", height=250)
+
+# Khai báo 2 Tab
+tab1, tab2 = st.tabs(["🔊 TAB 1: Full Audio (1 File Duy Nhất)", "🎭 TAB 2: Kịch Truyền Thanh (Chia File 5 Phút .ZIP)"])
+
+# ------------------------------------------
+# TAB 1: FULL AUDIO
+# ------------------------------------------
+with tab1:
+    st.subheader("Xuất toàn bộ kịch bản ra 1 file Audio duy nhất")
+    if st.button("🚀 Render Full Audio (1 File)"):
+        if not script_input.strip():
+            st.warning("Vui lòng nhập kịch bản!")
+        else:
+            try:
+                segments = parse_script_by_at_tag(script_input, role_map)
+                st.info(f"Đã bóc tách được {len(segments)} phân đoạn. Đang tiến hành tạo audio...")
+                
+                progress_bar = st.progress(0)
+                combined_audio = AudioSegment.empty()
+
+                for i, seg in enumerate(segments):
+                    temp_path = os.path.join(TEMP_DIR, f"tab1_seg_{i}.mp3")
+                    generate_tts_audio(seg["text"], seg["provider"], seg["voice_id"], temp_path)
+                    
+                    audio_clip = AudioSegment.from_file(temp_path)
+                    combined_audio += audio_clip + AudioSegment.silent(duration=400)
+                    
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    
+                    progress_bar.progress((i + 1) / len(segments))
+
+                # Ghép Nhạc Nền
+                if bgm_file:
+                    bgm = AudioSegment.from_file(bgm_file) + bgm_volume
+                    if len(bgm) < len(combined_audio):
+                        bgm = bgm.loop_for(len(combined_audio))
+                    bgm = bgm[:len(combined_audio)]
+                    final_audio = combined_audio.overlay(bgm)
+                else:
+                    final_audio = combined_audio
+
+                export_path = "Full_Audio_Kich_Truyen_Thanh.mp3"
+                final_audio.export(export_path, format="mp3")
+
+                st.success("🎉 Đã hoàn tất render Full Audio!")
+                st.audio(export_path)
+                
+                with open(export_path, "rb") as fp:
+                    st.download_button("📦 Tải File MP3 Hoàn Chỉnh", data=fp, file_name=export_path, mime="audio/mpeg")
+
+            except Exception as e:
+                st.error(f"Đã xảy ra lỗi: {str(e)}")
+            finally:
+                if os.path.exists(TEMP_DIR):
+                    shutil.rmtree(TEMP_DIR)
+                    os.makedirs(TEMP_DIR)
+
+# ------------------------------------------
+# TAB 2: KỊCH TRUYỀN THANH CHIA FILE 5 PHÚT
+# ------------------------------------------
+with tab2:
+    st.subheader("Phân chia kịch bản thành từng file ~5 phút (Ngắt đúng câu thoại)")
+    if st.button("🚀 Render & Chia File 5 Phút (.ZIP)"):
+        if not script_input.strip():
+            st.warning("Vui lòng nhập kịch bản!")
+        else:
+            try:
+                segments = parse_script_by_at_tag(script_input, role_map)
+                
+                # Gom nhóm câu thoại thành các file ~5 phút (700-800 từ)
+                chunks = []
+                current_chunk = []
+                current_words = 0
+
+                for seg in segments:
+                    seg_words = len(seg["text"].split())
+                    if current_words + seg_words > words_per_chunk and current_chunk:
+                        chunks.append(current_chunk)
+                        current_chunk = [seg]
+                        current_words = seg_words
+                    else:
+                        current_chunk.append(seg)
+                        current_words += seg_words
+
+                if current_chunk:
+                    chunks.append(current_chunk)
+
+                total_chunks = len(chunks)
+                st.info(f"Kịch bản được chia thành **{total_chunks} file kịch** (~5 phút/file).")
+
+                progress_bar = st.progress(0)
+                generated_files = []
+
+                bgm_audio = None
+                if bgm_file:
+                    bgm_audio = AudioSegment.from_file(bgm_file) + bgm_volume
+
+                for i, chunk_segs in enumerate(chunks):
+                    part_num = i + 1
+                    chunk_audio = AudioSegment.empty()
+
+                    for j, seg in enumerate(chunk_segs):
+                        temp_line_path = os.path.join(TEMP_DIR, f"p{part_num}_line_{j}.mp3")
+                        generate_tts_audio(seg["text"], seg["provider"], seg["voice_id"], temp_line_path)
+                        
+                        line_segment = AudioSegment.from_file(temp_line_path)
+                        chunk_audio += line_segment + AudioSegment.silent(duration=400)
+                        
+                        if os.path.exists(temp_line_path):
+                            os.remove(temp_line_path)
+
+                    # Mix BGM cho từng part
+                    if bgm_audio:
+                        matched_bgm = bgm_audio
+                        if len(matched_bgm) < len(chunk_audio):
+                            matched_bgm = matched_bgm.loop_for(len(chunk_audio))
+                        matched_bgm = matched_bgm[:len(chunk_audio)]
+                        final_chunk_audio = chunk_audio.overlay(matched_bgm)
+                    else:
+                        final_chunk_audio = chunk_audio
+
+                    final_part_name = f"Phan_{part_num:03d}_Kich_5Min.mp3"
+                    final_part_path = os.path.join(TEMP_DIR, final_part_name)
+                    final_chunk_audio.export(final_part_path, format="mp3")
+                    generated_files.append(final_part_path)
+
+                    progress_bar.progress(part_num / total_chunks)
+
+                # Nén ZIP
+                zip_filename = "Kich_Truyen_Thanh_5Phut_Full.zip"
+                with zipfile.ZipFile(zip_filename, 'w') as zipf:
+                    for file_path in generated_files:
+                        zipf.write(file_path, os.path.basename(file_path))
+
+                st.success("🎉 Đã hoàn tất render toàn bộ các file 5 phút!")
+
+                for file_path in generated_files:
+                    st.caption(os.path.basename(file_path))
+                    st.audio(file_path)
+
+                with open(zip_filename, "rb") as fp:
+                    st.download_button("📦 Tải Toàn Bộ File 5 Phút (.ZIP)", data=fp, file_name=zip_filename, mime="application/zip")
+
+            except Exception as e:
+                st.error(f"Đã xảy ra lỗi: {str(e)}")
+            finally:
+                if os.path.exists(TEMP_DIR):
+                    shutil.rmtree(TEMP_DIR)
+                    os.makedirs(TEMP_DIR)
