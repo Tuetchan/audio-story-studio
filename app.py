@@ -41,8 +41,9 @@ with st.sidebar:
     if 'roles_df' not in st.session_state:
         st.session_state.roles_df = pd.DataFrame(default_roles)
 
+    # Đã sửa lại Selectbox -> SelectboxColumn
     column_config = {
-        "Nguồn Giọng": st.column_config.Selectbox(
+        "Nguồn Giọng": st.column_config.SelectboxColumn(
             "Nguồn Giọng",
             options=["Edge-TTS (Miễn phí)", "ElevenLabs (Trả phí)", "OpenAI (Trả phí)"],
             required=True
@@ -114,7 +115,7 @@ def parse_script_by_at_tag(script_text, role_map):
     """Bóc tách kịch bản dựa vào ký hiệu @ ở đầu đoạn văn"""
     lines = script_text.split('\n')
     segments = []
-    current_char = "nguoidantruyen" # Mặc định nếu chưa gõ @
+    current_char = "nguoidantruyen"
 
     for line in lines:
         line_str = line.strip()
