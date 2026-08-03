@@ -1,177 +1,158 @@
 import streamlit as st
-import os
+import pandas as pd
 import re
+import os
 import zipfile
 import shutil
 import asyncio
+import requests
 import edge_tts
 from pydub import AudioSegment
 
 # Cấu hình trang web
-st.set_page_config(page_title="AI Audio Studio - File 5 Phút", page_icon="🎧", layout="wide")
+st.set_page_config(page_title="Studio Kịch Truyền Thanh AI Pro", page_icon="🎧", layout="wide")
 
 # Thư mục tạm
-TEMP_DIR = "temp_audio_chunks"
+TEMP_DIR = "temp_kicks_audio_pro"
 if not os.path.exists(TEMP_DIR):
     os.makedirs(TEMP_DIR)
 
 # ==========================================
-# 1. CẤU HÌNH SIDEBAR
+# 1. CẤU HÌNH API & PHÂN VAI (SIDEBAR)
 # ==========================================
-VOICE_OPTIONS = {
-    "Nữ - Hoài My (vi-VN-HoaiMyNeural)": "vi-VN-HoaiMyNeural",
-    "Nam - Nam Minh (vi-VN-NamMinhNeural)": "vi-VN-NamMinhNeural"
-}
-
 with st.sidebar:
-    st.header("⚙️ Cấu Hình Đọc")
-    selected_voice_name = st.selectbox("Chọn Giọng Đọc AI:", list(VOICE_OPTIONS.keys()))
-    selected_voice = VOICE_OPTIONS[selected_voice_name]
-    
-    words_per_chunk = st.slider(
-        "Số từ mục tiêu mỗi file (~5 phút):", 
-        min_value=500, 
-        max_value=1000, 
-        value=750, 
-        step=50,
-        help="700 - 800 từ tương đương khoảng 5 phút đọc thoại."
-    )
+    st.header("🔑 Cấu Hình API Key Trả Phí")
+    elevenlabs_key = st.text_input("ElevenLabs API Key:", type="password", help="Nhập API Key ElevenLabs nếu muốn dùng giọng trả phí")
+    openai_key = st.text_input("OpenAI API Key:", type="password", help="Nhập OpenAI API Key nếu muốn dùng OpenAI TTS")
     
     st.markdown("---")
-    st.header("🎚️ Hậu Kỳ (Audio Mixing)")
+    st.header("🎭 Phân Vai Giọng Đọc Nhân Vật")
+    st.caption("Gõ cú pháp `@Mã_Nhân_Vật` ở đầu mỗi đoạn kịch bản.")
+
+    # Cấu hình danh sách nhân vật mặc định
+    default_roles = [
+        {"Mã @": "NguoiDanTruyen", "Tên Vai": "Người dẫn truyện", "Nguồn Giọng": "Edge-TTS (Miễn phí)", "Voice ID": "vi-VN-HoaiMyNeural"},
+        {"Mã @": "NamChinh", "Tên Vai": "Nam chính", "Nguồn Giọng": "Edge-TTS (Miễn phí)", "Voice ID": "vi-VN-NamMinhNeural"},
+        {"Mã @": "NuChinh", "Tên Vai": "Nữ chính", "Nguồn Giọng": "Edge-TTS (Miễn phí)", "Voice ID": "vi-VN-HoaiMyNeural"},
+        {"Mã @": "NamChinh2", "Tên Vai": "Nam chính thứ 2", "Nguồn Giọng": "Edge-TTS (Miễn phí)", "Voice ID": "vi-VN-NamMinhNeural"},
+        {"Mã @": "NhanVatKhac", "Tên Vai": "Các nhân vật khác", "Nguồn Giọng": "Edge-TTS (Miễn phí)", "Voice ID": "vi-VN-HoaiMyNeural"},
+    ]
+
+    if 'roles_df' not in st.session_state:
+        st.session_state.roles_df = pd.DataFrame(default_roles)
+
+    column_config = {
+        "Nguồn Giọng": st.column_config.Selectbox(
+            "Nguồn Giọng",
+            options=["Edge-TTS (Miễn phí)", "ElevenLabs (Trả phí)", "OpenAI (Trả phí)"],
+            required=True
+        )
+    }
+
+    edited_roles = st.data_editor(
+        st.session_state.roles_df,
+        column_config=column_config,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+    # Chuyển đổi bảng phân vai thành Dictionary
+    role_map = {}
+    for _, row in edited_roles.iterrows():
+        role_map[row["Mã @"].strip().lower()] = {
+            "provider": row["Nguồn Giọng"],
+            "voice_id": row["Voice ID"].strip()
+        }
+
+    st.markdown("---")
+    st.header("⏱️ Cấu Hình File & Nhạc Nền")
+    words_per_chunk = st.slider("Số từ/file ở Tab 2 (~5 phút):", 500, 1000, 750, 50)
     bgm_file = st.file_uploader("Tải Nhạc Nền (BGM) - MP3/WAV", type=["mp3", "wav"])
     bgm_volume = st.slider("Âm lượng Nhạc nền (dB)", -40, 0, -20)
 
 # ==========================================
-# 2. HÀM TÁCH VĂN BẢN VÀ XỬ LÝ TTS
+# 2. HÀM XỬ LÝ TTS & BÓC TÁCH KỊCH BẢN
 # ==========================================
-def split_text_by_sentences_and_words(text, target_words=750):
-    """
-    Tách văn bản dựa trên dấu kết thúc câu (. ! ? hoặc xuống dòng).
-    Gom các câu lại sao cho tổng số từ đạt khoảng target_words (700-800 từ)
-    mà không bao giờ bị ngắt ngang câu.
-    """
-    # Tách văn bản thành các câu dựa trên dấu . ! ? hoặc ký tự xuống dòng
-    sentences = re.split(r'(?<=[.!?])\s+|\n+', text)
-    chunks = []
-    current_chunk = []
-    current_word_count = 0
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        
-        words_in_sentence = len(sentence.split())
-        
-        # Nếu cộng câu này vào mà vượt quá lượng từ target và đã có câu trước đó
-        if current_word_count + words_in_sentence > target_words and current_chunk:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [sentence]
-            current_word_count = words_in_sentence
-        else:
-            current_chunk.append(sentence)
-            current_word_count += words_in_sentence
-
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-
-    return chunks
-
-async def generate_audio_async(text, voice, output_path):
+async def generate_edge_tts_async(text, voice, output_path):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_path)
 
-def generate_audio(text, voice, output_path):
-    asyncio.run(generate_audio_async(text, voice, output_path))
+def generate_tts_audio(text, provider, voice_id, output_path):
+    """Hàm điều hướng tạo âm thanh theo nguồn giọng (Free / ElevenLabs / OpenAI)"""
+    # 1. ElevenLabs Trả phí
+    if provider == "ElevenLabs (Trả phí)" and elevenlabs_key:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": elevenlabs_key}
+        data = {"text": text, "model_id": "eleven_multilingual_v2"}
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(response.content)
+            return
+        else:
+            st.warning(f"Lỗi ElevenLabs API ({response.status_code}), chuyển về giọng mặc định Edge-TTS.")
+
+    # 2. OpenAI Trả phí
+    elif provider == "OpenAI (Trả phí)" and openai_key:
+        url = "https://api.openai.com/v1/audio/speech"
+        headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+        data = {"model": "tts-1", "input": text, "voice": voice_id if voice_id in ["alloy", "echo", "fable", "onyx", "nova", "shimmer"] else "alloy"}
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(response.content)
+            return
+        else:
+            st.warning(f"Lỗi OpenAI API ({response.status_code}), chuyển về giọng mặc định Edge-TTS.")
+
+    # 3. Mặc định / Free Edge-TTS
+    default_voice = voice_id if "Neural" in voice_id else "vi-VN-HoaiMyNeural"
+    asyncio.run(generate_edge_tts_async(text, default_voice, output_path))
+
+
+def parse_script_by_at_tag(script_text, role_map):
+    """Bóc tách kịch bản dựa vào ký hiệu @ở đầu đoạn văn"""
+    lines = script_text.split('\n')
+    segments = []
+    current_char = "nguoidantruyen" # Mặc định nếu chưa gõ @
+
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            continue
+
+        # Regex tìm ký hiệu @Tên_Nhân_Vật ở đầu dòng
+        match = re.match(r'^@([^\s:]+)\b[:\s]*(.*)', line_str)
+        if match:
+            char_tag = match.group(1).strip().lower()
+            text = match.group(2).strip()
+            current_char = char_tag
+        else:
+            text = line_str
+
+        if text:
+            role_info = role_map.get(current_char, {
+                "provider": "Edge-TTS (Miễn phí)", 
+                "voice_id": "vi-VN-HoaiMyNeural"
+            })
+            segments.append({
+                "character": current_char,
+                "provider": role_info["provider"],
+                "voice_id": role_info["voice_id"],
+                "text": text
+            })
+
+    return segments
 
 # ==========================================
-# 3. GIAO DIỆN CHÍNH & TẠO AUDIO
+# 3. GIAO DIỆN CHÍNH & XỬ LÝ TABS
 # ==========================================
-st.title("🎧 Studio Tạo Audio Truyện/Kịch (Xuất File 5 Phút)")
-st.markdown("Hệ thống sẽ tự động phân chia văn bản thành các phần dài **~5 phút (700-800 từ)**, chỉ ngắt ở **dấu chấm/kết thúc câu** và đóng gói thành 1 file ZIP.")
-
-script_input = st.text_area("Dán toàn bộ văn bản truyện/kịch vào đây:", height=300)
-
-if st.button("🚀 Render & Chia File 5 Phút (.ZIP)"):
-    if not script_input.strip():
-        st.warning("Vui lòng nhập nội dung văn bản!")
-    else:
-        try:
-            # Bước 1: Tách văn bản thành từng khối 5 phút
-            chunks = split_text_by_sentences_and_words(script_input, target_words=words_per_chunk)
-            total_chunks = len(chunks)
-            st.info(f"Đã phân chia văn bản thành **{total_chunks} phần** (mỗi phần ~5 phút, ngắt đúng dấu chấm).")
-            
-            progress_bar = st.progress(0)
-            generated_files = []
-            
-            # Đọc file BGM 1 lần nếu có
-            bgm_audio = None
-            if bgm_file:
-                bgm_audio = AudioSegment.from_file(bgm_file) + bgm_volume
-
-            # Bước 2: Tạo Audio cho từng phần 5 phút
-            for i, chunk_text in enumerate(chunks):
-                part_num = i + 1
-                word_count = len(chunk_text.split())
-                st.write(f"🎙️ **Đang tạo Phần {part_num}/{total_chunks}** ({word_count} từ)...")
-                
-                raw_path = os.path.join(TEMP_DIR, f"temp_part_{part_num}.mp3")
-                final_part_name = f"Phan_{part_num:03d}_5Min.mp3"
-                final_part_path = os.path.join(TEMP_DIR, final_part_name)
-                
-                # Gọi TTS sinh giọng
-                generate_audio(chunk_text, selected_voice, raw_path)
-                
-                # Trộn nhạc nền nếu có
-                part_audio = AudioSegment.from_file(raw_path)
-                if bgm_audio:
-                    # Lặp BGM cho bằng độ dài giọng đọc
-                    bgm_matched = bgm_audio
-                    if len(bgm_matched) < len(part_audio):
-                        bgm_matched = bgm_matched.loop_for(len(part_audio))
-                    bgm_matched = bgm_matched[:len(part_audio)]
-                    
-                    final_audio = part_audio.overlay(bgm_matched)
-                else:
-                    final_audio = part_audio
-                
-                # Xuất file MP3 của phần này
-                final_audio.export(final_part_path, format="mp3")
-                generated_files.append(final_part_path)
-                
-                # Cập nhật thanh tiến trình
-                progress_bar.progress(part_num / total_chunks)
-
-            # Bước 3: Nén tất cả các file 5 phút vào 1 file ZIP
-            zip_filename = "Thu_Muc_Audio_5Phut_Full.zip"
-            with zipfile.ZipFile(zip_filename, 'w') as zipf:
-                for file_path in generated_files:
-                    zipf.write(file_path, os.path.basename(file_path))
-
-            st.success("🎉 Đã xuất thành công toàn bộ các file 5 phút!")
-
-            # Hiển thị trình nghe thử cho từng phần
-            st.markdown("### 🎧 Nghe thử từng phần:")
-            for file_path in generated_files:
-                st.caption(os.path.basename(file_path))
-                st.audio(file_path)
-
-            # Nút tải file ZIP
-            with open(zip_filename, "rb") as fp:
-                st.download_button(
-                    label="📦 Tải Toàn Bộ File 5 Phút (.ZIP)",
-                    data=fp,
-                    file_name=zip_filename,
-                    mime="application/zip"
-                )
-
-        except Exception as e:
-            st.error(f"Đã xảy ra lỗi: {str(e)}")
-
-        finally:
-            # Dọn dẹp thư mục tạm
-            if os.path.exists(TEMP_DIR):
-                shutil.rmtree(TEMP_DIR)
-                os.makedirs(TEMP_DIR)
+st.title("🎧 Studio Tạo Kịch Truyền Thanh AI Pro")
+st.markdown("""
+**Hướng dẫn cú pháp:** Đặt `@Mã_Nhân_Vật` trước mỗi lời thoại. 
+Ví dụ:
+```text
+@NguoiDanTruyen Ngày xửa ngày xưa, tại một ngôi làng nọ...
+@NamChinh Ta nhất định phải ra đi tìm sự thật!
+@NuChinh Chàng hãy cẩn thận nhé!
+@NamChinh2 Ta sẽ đi cùng huynh!
