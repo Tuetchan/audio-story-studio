@@ -2,9 +2,10 @@ import streamlit as st
 import pandas as pd
 import re
 import os
-import subprocess
 import zipfile
 import shutil
+import asyncio
+import edge_tts
 from pydub import AudioSegment
 
 # Cấu hình trang web
@@ -18,7 +19,6 @@ if not os.path.exists(TEMP_DIR):
 # ==========================================
 # 1. DANH BẠ GIỌNG ĐỌC (SIDEBAR)
 # ==========================================
-# Giọng mẫu của Edge-TTS (Bạn có thể đổi sang API ElevenLabs sau)
 DEFAULT_VOICES = [
     {"Nhân vật": "NguoiDanTruyen", "Voice ID": "vi-VN-HoaiMyNeural"},
     {"Nhân vật": "NamChinh", "Voice ID": "vi-VN-NamMinhNeural"},
@@ -48,7 +48,8 @@ def parse_script(script_text):
     lines = script_text.split('\n')
     segments = []
     for line in lines:
-        if not line.strip(): continue
+        if not line.strip(): 
+            continue
         
         match = re.match(r'\[(.*?)\]:\s*(.*)', line)
         if match:
@@ -56,14 +57,18 @@ def parse_script(script_text):
         else:
             char, text = "NguoiDanTruyen", line.strip()
             
-        vid = voice_dict.get(char, "vi-VN-HoaiMyNeural") # Mặc định nếu gõ sai
+        vid = voice_dict.get(char, "vi-VN-HoaiMyNeural")
         segments.append({"character": char, "voice_id": vid, "text": text})
     return segments
 
+async def generate_audio_edge_tts_async(text, voice, output_path):
+    """Chạy Edge-TTS trực tiếp qua Python (Không qua Terminal)"""
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
+
 def generate_audio_edge_tts(text, voice, output_path):
-    """Gọi Edge-TTS thông qua dòng lệnh để tạo file âm thanh miễn phí"""
-    command = f'edge-tts --voice {voice} --text "{text}" --write-media {output_path}'
-    subprocess.run(command, shell=True)
+    """Hàm bọc để Streamlit gọi bất đồng bộ"""
+    asyncio.run(generate_audio_edge_tts_async(text, voice, output_path))
 
 # ==========================================
 # 3. GIAO DIỆN CHÍNH
@@ -77,69 +82,75 @@ if st.button("🚀 Render Toàn Bộ Audio & Ghép Nhạc"):
     if not script_input:
         st.warning("Vui lòng nhập kịch bản!")
     else:
-        # Bước 1: Bóc tách
-        segments = parse_script(script_input)
-        st.info(f"Đã bóc tách được {len(segments)} phân đoạn thoại. Đang tiến hành thu âm AI...")
-        
-        progress_bar = st.progress(0)
-        generated_files = []
-        combined_audio = AudioSegment.empty() # Khởi tạo một file audio rỗng để nối vào
-        
-        # Bước 2: Sinh Audio cho từng câu
-        for i, seg in enumerate(segments):
-            file_name = f"{i+1:03d}_{seg['character']}.mp3"
-            file_path = os.path.join(TEMP_DIR, file_name)
+        try:
+            # Bước 1: Bóc tách
+            segments = parse_script(script_input)
+            st.info(f"Đã bóc tách được {len(segments)} phân đoạn thoại. Đang tiến hành thu âm AI...")
             
-            with st.spinner(f"Đang thu âm: {seg['character']}..."):
-                generate_audio_edge_tts(seg['text'], seg['voice_id'], file_path)
-                generated_files.append(file_path)
-                
-                # Nối audio vào file tổng (thêm 500ms tĩnh lặng giữa các câu)
-                audio_clip = AudioSegment.from_file(file_path)
-                combined_audio += audio_clip + AudioSegment.silent(duration=500)
-                
-            progress_bar.progress((i + 1) / len(segments))
+            progress_bar = st.progress(0)
+            generated_files = []
+            combined_audio = AudioSegment.empty()
             
-        st.success("Hoàn tất thu âm các nhân vật!")
-
-        # Bước 3: Ghép nhạc nền (BGM)
-        final_export_path = "Thanh_Pham_Kich_Audio.mp3"
-        with st.spinner("Đang lồng ghép nhạc nền (Mixing)..."):
-            if bgm_file:
-                bgm = AudioSegment.from_file(bgm_file)
-                bgm = bgm + bgm_volume # Giảm âm lượng
+            # Bước 2: Sinh Audio cho từng câu
+            for i, seg in enumerate(segments):
+                file_name = f"{i+1:03d}_{seg['character']}.mp3"
+                file_path = os.path.join(TEMP_DIR, file_name)
                 
-                # Lặp nhạc nền cho dài bằng độ dài giọng đọc
-                if len(bgm) < len(combined_audio):
-                    bgm = bgm.loop_for(len(combined_audio))
-                bgm = bgm[:len(combined_audio)]
+                with st.spinner(f"Đang thu âm: {seg['character']}..."):
+                    generate_audio_edge_tts(seg['text'], seg['voice_id'], file_path)
+                    generated_files.append(file_path)
+                    
+                    # Nối audio vào file tổng (thêm 500ms tĩnh lặng giữa các câu)
+                    audio_clip = AudioSegment.from_file(file_path)
+                    combined_audio += audio_clip + AudioSegment.silent(duration=500)
+                    
+                progress_bar.progress((i + 1) / len(segments))
                 
-                # Trộn 2 track lại với nhau
-                final_audio = combined_audio.overlay(bgm)
-            else:
-                final_audio = combined_audio
-                
-            final_audio.export(final_export_path, format="mp3")
+            st.success("Hoàn tất thu âm các nhân vật!")
 
-        # Bước 4: Đóng gói ZIP (Gồm file gốc lẻ + File thành phẩm đã mix)
-        zip_filename = "Du_An_Kich_Truyen_Thanh.zip"
-        with zipfile.ZipFile(zip_filename, 'w') as zipf:
-            zipf.write(final_export_path)
-            for f in generated_files:
-                zipf.write(f, os.path.basename(f))
+            # Bước 3: Ghép nhạc nền (BGM)
+            final_export_path = "Thanh_Pham_Kich_Audio.mp3"
+            with st.spinner("Đang lồng ghép nhạc nền (Mixing)..."):
+                if bgm_file:
+                    bgm = AudioSegment.from_file(bgm_file)
+                    bgm = bgm + bgm_volume # Điều chỉnh âm lượng
+                    
+                    # Lặp nhạc nền cho bằng độ dài giọng đọc
+                    if len(bgm) < len(combined_audio):
+                        bgm = bgm.loop_for(len(combined_audio))
+                    bgm = bgm[:len(combined_audio)]
+                    
+                    # Trộn 2 track
+                    final_audio = combined_audio.overlay(bgm)
+                else:
+                    final_audio = combined_audio
+                    
+                final_audio.export(final_export_path, format="mp3")
 
-        # Hiển thị nút tải
-        st.success("🎉 Mọi thứ đã sẵn sàng!")
-        st.audio(final_export_path) # Cho phép nghe thử ngay trên web
-        
-        with open(zip_filename, "rb") as fp:
-            st.download_button(
-                label="📦 Tải Toàn Bộ Dự Án Về Máy (.ZIP)",
-                data=fp,
-                file_name=zip_filename,
-                mime="application/zip"
-            )
+            # Bước 4: Đóng gói ZIP
+            zip_filename = "Du_An_Kich_Truyen_Thanh.zip"
+            with zipfile.ZipFile(zip_filename, 'w') as zipf:
+                zipf.write(final_export_path)
+                for f in generated_files:
+                    zipf.write(f, os.path.basename(f))
+
+            # Hiển thị nút tải
+            st.success("🎉 Mọi thứ đã sẵn sàng!")
+            st.audio(final_export_path)
             
-        # Dọn dẹp máy chủ ảo
-        shutil.rmtree(TEMP_DIR)
-        os.makedirs(TEMP_DIR)
+            with open(zip_filename, "rb") as fp:
+                st.download_button(
+                    label="📦 Tải Toàn Bộ Dự Án Về Máy (.ZIP)",
+                    data=fp,
+                    file_name=zip_filename,
+                    mime="application/zip"
+                )
+                
+        except Exception as e:
+            st.error(f"Đã xảy ra lỗi trong quá trình xử lý: {str(e)}")
+
+        finally:
+            # Dọn dẹp máy chủ ảo an toàn dù thành công hay sập lỗi
+            if os.path.exists(TEMP_DIR):
+                shutil.rmtree(TEMP_DIR)
+                os.makedirs(TEMP_DIR)
